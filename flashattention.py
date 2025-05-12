@@ -1,118 +1,82 @@
 import torch
 import torch.nn as nn
 #from einops import rearrange
-
+from sklearn.metrics import accuracy_score
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from torchvision.models import VisionTransformer
 import numpy as np
 import pickle
-from sklearn.metrics import accuracy_score
+from flash_attn.modules.mha import MHA
+from torch.cuda.amp import autocast, GradScaler
 import time
-# 多头自注意力机制
-class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads):
-        super(MultiHeadSelfAttention, self).__init__()
-        assert embed_dim % num_heads == 0, "Embedding dimension must be divisible by number of heads."
 
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-
-        self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim)
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
-
-    def forward(self, x):
-        qkv = self.qkv_proj(x)
-        batch_size, seq_length, _ = x.size()
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
-
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
-        attn_probs = torch.softmax(attn_scores, dim=-1)
-        attn_output = torch.matmul(attn_probs, v)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, self.embed_dim)
-        output = self.out_proj(attn_output)
-        return output
-
-# 前馈网络
-class FeedForward(nn.Module):
-    def __init__(self, embed_dim, hidden_dim):
-        super(FeedForward, self).__init__()
-        self.fc1 = nn.Linear(embed_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, embed_dim)
-        self.relu = nn.GELU()
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.fc2(x)
-        return x
-
-# Transformer 编码器层
-class TransformerEncoderLayer(nn.Module):
-    def __init__(self, embed_dim, num_heads, hidden_dim, dropout=0):
-        super(TransformerEncoderLayer, self).__init__()
-        self.self_attn = MultiHeadSelfAttention(embed_dim, num_heads)
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.feed_forward = FeedForward(embed_dim, hidden_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        attn_output = self.self_attn(x)
-        x = self.norm1(x + self.dropout(attn_output))
-        ff_output = self.feed_forward(x)
-        x = self.norm2(x + self.dropout(ff_output))
-        # x=x+self.self_attn(self.norm1(x))
-        # x=x+self.feed_forward(self.norm2(x))
-        return x
-
-# Vision Transformer 模型
-class VisionTransformer(nn.Module):
-    def __init__(self, image_size=32, patch_size=4, num_classes=10, embed_dim=192, num_heads=3, num_layers=12,
-                 hidden_dim=768, dropout=0.001):
-        super(VisionTransformer, self).__init__()
-        assert image_size % patch_size == 0, "Image size must be divisible by patch size."
-        num_patches = (image_size // patch_size) ** 2
-
+class ViT(nn.Module):
+    def __init__(self, image_size=224, patch_size=16, num_classes=10, embed_dim=768, 
+                 num_layers=12,hidden_dim=128, num_heads=12, dropout=0.01):
+        super().__init__()
         # 添加重塑层
         self.reshape_layer = nn.Unflatten(1, (3, image_size, image_size))
 
-        self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
-        #self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        #self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.patch_embed = nn.Conv2d(3, embed_dim, patch_size, patch_size)
+        num_patches = (image_size // patch_size) ** 2
         self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.randn(1, num_patches + 1, embed_dim))
-
-        self.dropout = nn.Dropout(dropout)
-
+        
         self.encoder_layers = nn.ModuleList([
-            TransformerEncoderLayer(embed_dim, num_heads, hidden_dim, dropout) for _ in range(num_layers)
+            TransformerBlock(embed_dim, num_heads, hidden_dim, dropout)
+            for _ in range(num_layers)
         ])
-
         self.norm = nn.LayerNorm(embed_dim)
         self.fc = nn.Linear(embed_dim, num_classes)
 
     def forward(self, x):
-        # 重塑输入
+        
         x = self.reshape_layer(x)
-        x = self.patch_embed(x)
+        x = self.patch_embed(x)  # [B, C, H, W] -> [B, C, H/p, W/p]
+        #x = rearrange(x, 'b c h w -> b (h w) c')
         x = x.flatten(2).transpose(1, 2)
-        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-        x = x + self.pos_embed
-        x = self.dropout(x)
-
+        
+        cls_token = self.cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat((cls_token, x), dim=1)
+        x += self.pos_embed
+        
         for layer in self.encoder_layers:
             x = layer(x)
-
         x = self.norm(x)
         cls_output = x[:, 0]
-        output = self.fc(cls_output)
-        return output
+        return self.fc(cls_output)
+
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_dim, num_heads, hidden_dim, dropout=0.01):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = MHA(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+
+        self.mlp = MLP(embed_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):###没使用dropout
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class MLP(nn.Module):
+    def __init__(self, in_dim, hidden_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, in_dim)
+
+    def forward(self, x):
+        return self.fc2(self.act(self.fc1(x)))
+
 
 ###########################################################
 # 加载本地 CIFAR-10 数据集
@@ -178,7 +142,7 @@ test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 ##############################################################################
 
 # 创建 ViT 模型实例
-model = VisionTransformer(
+model = ViT(
             image_size=32,
             patch_size=4,
             num_classes=10,
@@ -189,21 +153,37 @@ model = VisionTransformer(
 
 # 定义损失函数和优化器
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=0.01)
+optimizer = optim.Adam(model.parameters(), lr=0.001)
 
 # 训练模型
 num_epochs = 10
+time_list=[]
+scaler = GradScaler(init_scale=2**16)
 for epoch in range(num_epochs):
     model.train()
     running_loss = 0.0
+    torch.cuda.synchronize()
+    start_time = time.time() 
     for inputs, labels in train_loader:
         optimizer.zero_grad()
+        # with autocast():
+        #     outputs = model(inputs)
+        #     loss = criterion(outputs, labels)
         outputs = model(inputs)
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
+        # scaler.scale(loss).backward()
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # scaler.step(optimizer)
+        # scaler.update()
+
         running_loss += loss.item()
+    torch.cuda.synchronize()
+    end_time = time.time()
+    time_list.append(end_time - start_time)    
     print(f'Epoch {epoch + 1}/{num_epochs}, Loss: {running_loss / len(train_loader)}')
+    
 
 # 评估模型
 model.eval()
@@ -237,3 +217,4 @@ test_labels=test_labels.cpu().numpy()
 #
 vit_accuracy = accuracy_score(test_labels, vit_result)
 print(f"vit 模型的准确率: {vit_accuracy * 100:.2f}%")
+print(f"vit 模型所用时间: {sum(time_list):.2f}s")

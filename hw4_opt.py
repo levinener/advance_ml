@@ -7,7 +7,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from torchvision.models import VisionTransformer
 import numpy as np
 import pickle
-
+import time
 from torch.utils.cpp_extension import load
 
 # 自动编译并加载CUDA扩展
@@ -65,13 +65,15 @@ class OptimizedTransformerBlock(nn.Module):
 
     def forward(self, x):
         # 使用融合LayerNorm
-        residual = x
-        x = vit_ops.fused_layer_norm(x, self.norm1.weight, self.norm1.bias, 1e-6)
-        x = residual + self.attn(x)
+        # residual = x
+        # x = vit_ops.fused_layer_norm(x, self.norm1.weight, self.norm1.bias, 1e-6)
+        # x = residual + self.attn(x)
         
-        residual = x
-        x = vit_ops.fused_layer_norm(x, self.norm2.weight, self.norm2.bias, 1e-6)
-        x = residual + self.mlp(x)
+        # residual = x
+        # x = vit_ops.fused_layer_norm(x, self.norm2.weight, self.norm2.bias, 1e-6)
+        # x = residual + self.mlp(x)
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
         return x
 
 class OptimizedMultiHeadAttention(nn.Module):
@@ -92,14 +94,16 @@ class OptimizedMultiHeadAttention(nn.Module):
         q, k, v = qkv.chunk(3, dim=-1)
         q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
         k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-        v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2).contiguous().half()
+        v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
         # 使用自定义算子
-        attn = vit_ops.qk_matmul(q.half(), k.half()).float() * self.scale
-        attn = vit_ops.optimized_softmax(attn.half())
-        print(attn.dtype)
-        x = torch.matmul(attn, v)  # 可继续优化
-        x = x.transpose(1,2).contiguous().reshape(B, N, C).float()
+        #attn = vit_ops.qk_matmul(q, k) * self.scale
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = vit_ops.optimized_softmax(attn)
+        #attn = torch.nn.functional.softmax(attn, dim=-1).half()
+  
+        x = torch.matmul(attn,v)  # 可继续优化
+        x = x.transpose(1,2).reshape(B, N, C).float()
         return self.proj(x)
 
 
@@ -192,17 +196,30 @@ criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=0.01)
 
 # 训练模型
-num_epochs = 10
+num_epochs = 20
+time_list=[]
 for epoch in range(num_epochs):
     model.train()
     running_loss = 0.0
+    torch.cuda.synchronize()
+    start_time = time.time() 
     for inputs, labels in train_loader:
         optimizer.zero_grad()
         outputs = model(inputs)
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
+        # with autocast():
+        #     outputs = model(inputs)
+        #     loss = criterion(outputs, labels)
+        # scaler.scale(loss).backward()
+        # scaler.step(optimizer)
+        # scaler.update()
         running_loss += loss.item()
+    torch.cuda.synchronize()
+    end_time = time.time()
+    time_list.append(end_time - start_time)
+    
     print(f'Epoch {epoch + 1}/{num_epochs}, Loss: {running_loss / len(train_loader)}')
 
 # 评估模型
@@ -230,10 +247,12 @@ def predict(model, data):
 
 ################################################################
 
-vit_result_gpu=predict(model,test_data)
-print(device)
-vit_result = vit_result_gpu.cpu().numpy()
-test_labels=test_labels.cpu().numpy()
-#
-vit_accuracy = accuracy_score(test_labels, vit_result)
-print(f"vit 模型的准确率: {vit_accuracy * 100:.2f}%")
+# vit_result_gpu=predict(model,test_data)
+# print(device)
+# vit_result = vit_result_gpu.cpu().numpy()
+# test_labels=test_labels.cpu().numpy()
+# #
+# vit_accuracy = accuracy_score(test_labels, vit_result)
+# print(f"vit 模型的准确率: {vit_accuracy * 100:.2f}%")
+print(f"vit 模型所用时间: {sum(time_list):.2f}s")
+print(time_list)
